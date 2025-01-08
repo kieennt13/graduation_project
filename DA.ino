@@ -1,8 +1,14 @@
-
+#define BLYNK_TEMPLATE_ID "TMPLbADd2eoI"
+#define BLYNK_TEMPLATE_NAME "Quickstart Template"
+#define BLYNK_AUTH_TOKEN "r7xJXra0cOUfoHN3v-NJKKRqJ7LBTYLd"
+#include <BlynkSimpleEsp32.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
 #include <hailuu1905-project-1_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
-#include "esp_camera.h"
 #include <ESP32Servo.h>
+#include "esp_camera.h"
+
 #define CAMERA_MODEL_AI_THINKER // Has PSRAM
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
@@ -22,21 +28,22 @@
 #define PCLK_GPIO_NUM 22
 
 
-
-/* Constant defines -------------------------------------------------------- */
 #define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240
 #define EI_CAMERA_FRAME_BYTE_SIZE 3
+
 
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ESP32-CAM doesn't have dedicated i2c pins, so we define our own. Let's choose 15 and 14
-#define I2C_SDA 15
-#define I2C_SCL 14
+#define I2C_SDA 13
+#define I2C_SCL 2
 TwoWire I2Cbus = TwoWire(0);
+
+#define TRIG_PIN 15  // Chân Trig của SRF05
+#define ECHO_PIN 14  // Chân Echo của SRF05
 
 // Display defines
 #define SCREEN_WIDTH 128
@@ -45,14 +52,14 @@ TwoWire I2Cbus = TwoWire(0);
 #define SCREEN_ADDRESS 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &I2Cbus, OLED_RESET);
 
-#define TRIG_PIN 16  // Chân thay thế cho TRIG
-#define ECHO_PIN 13  // Chân thay thế cho ECHO
-
 Servo myServo;
-const int servoPin = 12;
+const int servoPin = 4;
+int defaultAngle = 90;
+int canAngle = 60;
+int bottleAngle = 150;
 
-
-
+const char* ssid = "Tang 5";     // Replace with your Wi-Fi SSID
+const char* password = "HaiLien485200"; // Replace with your Wi-Fi password
 /* Private variables ------------------------------------------------------- */
 static bool debug_nn = false;  // Set this to true to see e.g. features generated from the raw signal
 static bool is_initialised = false;
@@ -90,247 +97,217 @@ static camera_config_t camera_config = {
   .fb_location = CAMERA_FB_IN_PSRAM,
   .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
-void initSRF05() {
-    pinMode(TRIG_PIN, OUTPUT);
-    pinMode(ECHO_PIN, INPUT);
-}
 
-long measureDistance() {
+/* Function definitions ------------------------------------------------------- */
+bool ei_camera_init(void);
+void ei_camera_deinit(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+float measureDistance();
+float measureDistance() {
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
-
-    long duration = pulseIn(ECHO_PIN, HIGH);
-    long distance = duration * 0.034 / 2;  // Tính khoảng cách (cm)
-    return distance;
+    float duration = pulseIn(ECHO_PIN, HIGH);
+    return (duration / 2) * 0.0343;  // Chuyển đổi thời gian thành cm
 }
-/* Function definitions ------------------------------------------------------- */
-bool ei_camera_init(void);
-void ei_camera_deinit(void);
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
-
+void checkTrashBinFull() {
+    float distance = measureDistance(); // Đo khoảng cách bằng SRF05
+    if (distance < 10.0) {
+        Blynk.virtualWrite(V0, distance);
+        Serial.println("Trash bin is full!");
+        // Hiển thị thông báo trên OLED
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.print("Trash bin full!");
+        Blynk.logEvent("trash_bin_full");
+        display.display();
+        delay(3000); // Hiển thị trong 3 giây
+    } else {
+      
+    }
+}
 void setup() {
-    // Khởi tạo Serial để debug
-    Serial.begin(115200);
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+  // Initialize I2C with our defined pins
+  I2Cbus.begin(I2C_SDA, I2C_SCL, 100000);
 
-    // Khởi tạo giao tiếp I2C cho màn hình OLED
-    I2Cbus.begin(I2C_SDA, I2C_SCL, 100000);
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("SSD1306 OLED display failed to initialize.");
-        while (true);
-        Serial.println("OLED init failed. Check connections!");
+  // Khởi tạo servo
+  myServo.attach(servoPin);
+  myServo.write(defaultAngle); // Đặt góc mặc định
+
+  // Khởi tạo SRF05
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.printf("SSD1306 OLED display failed to initalize.\nCheck that display SDA is connected to pin %d and SCL connected to pin %d\n", I2C_SDA, I2C_SCL);
+    while (true)
+      ;
+  }
+
+
+  //comment out the below line to start inference immediately after upload
+  while (!Serial);
+  if (ei_camera_init() == false) {
+    ei_printf("Failed to initialize Camera!\r\n");
+  } else {
+    ei_printf("Camera initialized\r\n");
+  }
+
+  ei_printf("\nStarting continious inference in 2 seconds...\n");
+   display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.print("Starting continious\n inference in\n 2 seconds...");
+  display.display();
+  ei_sleep(2000);
+    display.clearDisplay();
+
+}
+  
+
+
+/**
+* @brief      Get data and run inferencing
+*
+* @param[in]  debug  Get debug info if true
+*/
+void loop() {
+  display.clearDisplay();
+   Blynk.run();
+  // instead of wait_ms, we'll wait on the signal, this allows threads to cancel us...
+  if (ei_sleep(5) != EI_IMPULSE_OK) {
+    return;
+  }
+      // Đo khoảng cách
+    float distance = measureDistance();
+    Serial.printf("Distance: %.2f cm\n", distance);
+
+  snapshot_buf = (uint8_t *)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+
+  // check if allocation was successful
+  if (snapshot_buf == nullptr) {
+    ei_printf("ERR: Failed to allocate snapshot buffer!\n");
+    return;
+  }
+
+  ei::signal_t signal;
+  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  signal.get_data = &ei_camera_get_data;
+
+  if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+    ei_printf("Failed to capture image\r\n");
+    free(snapshot_buf);
+    return;
+  }
+
+  // Run the classifier
+  ei_impulse_result_t result = { 0 };
+
+  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+  if (err != EI_IMPULSE_OK) {
+    ei_printf("ERR: Failed to run classifier (%d)\n", err);
+    return;
+  }
+
+ // print the predictions
+ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+          result.timing.dsp, result.timing.classification, result.timing.anomaly);
+
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+bool bb_found = result.bounding_boxes[0].value > 0;
+for (size_t ix = 0; ix < result.bounding_boxes_count; ix++) {
+    auto bb = result.bounding_boxes[ix];
+    if (bb.value == 0) {
+        continue;
+    }
+    ei_printf("    %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\n", bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
+    display.setCursor(0, 20 * ix);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.print(bb.label);
+    display.print("-");
+    display.print(int((bb.value)*100));
+    display.print("%");
+    display.display();
+    delay(8000);
+
+// Xử lý servo dựa trên nhãn nhận diện được
+if (strcmp(bb.label, "can") == 0) {
+    myServo.write(canAngle);
+
+    // Hiển thị trạng thái servo
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.print("Sorting: Can");
+    display.display();
+    
+    delay(2000); // Chờ servo hoàn tất di chuyển
+
+    checkTrashBinFull(); // Kiểm tra thùng rác đầy sau khi servo quay
+} else if (strcmp(bb.label, "bottle") == 0) {
+    myServo.write(bottleAngle);
+
+    // Hiển thị trạng thái servo
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.print("Sorting: Bottle");
+    display.display();
+
+    delay(2000); // Chờ servo hoàn tất di chuyển
+
+    checkTrashBinFull(); // Kiểm tra thùng rác đầy sau khi servo quay
+}
+
+// Trả servo về vị trí mặc định
+myServo.write(defaultAngle);
+display.clearDisplay();
+
+}
+if (!bb_found) {
+    ei_printf("    No objects found\n");
+    display.setCursor(0, 16);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.print("No objects found");
+    display.display();
+}
+#else
+for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+    ei_printf("    %s: %.5f\n", result.classification[ix].label,
+              result.classification[ix].value);
+
+    // Xử lý servo dựa trên nhãn nhận diện được
+    if (strcmp(result.classification[ix].label, "can") == 0 && result.classification[ix].value > 0.5) {
+        myServo.write(canAngle);
+        
+        delay(1000);
+    } else if (strcmp(result.classification[ix].label, "bottle") == 0 && result.classification[ix].value > 0.5) {
+        myServo.write(bottleAngle);
+        
         delay(1000);
     }
-
-    myServo.attach(servoPin);
-
-    // Hiển thị thông báo kiểm tra servo trên OLED
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.print("Testing servo...");
-    display.display();
-
-    // Kiểm tra phạm vi hoạt động của servo
-    Serial.println("Testing servo movement...");
-    myServo.write(90);  // Góc trung bình
-    delay(1000);        // Giữ ở góc này 1 giây
-    myServo.write(150); // Góc tối đa
-    delay(1000);        // Giữ ở góc này 1 giây
-    myServo.write(30);  // Góc tối thiểu
-    delay(1000);        // Giữ ở góc này 1 giây
-    myServo.write(90);  // Reset về góc trung bình
-    delay(1000);
-
-    // Xóa thông báo và chuyển sang phần tiếp theo
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("Servo test complete.");
-    display.display();
-    delay(2000); // Giữ kết quả trên OLED trước khi tiếp tục
-
-    // Khởi tạo camera
-    Serial.println("Initializing camera...");
-    if (ei_camera_init() == false) {
-        ei_printf("Failed to initialize Camera!\r\n");
-    } else {
-        ei_printf("Camera initialized\r\n");
-    }
-
-    ei_printf("\nStarting continuous inference in 2 seconds...\n");
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("Starting continuous\n inference in\n 2 seconds...");
-    display.display();
-    ei_sleep(2000);
-    display.clearDisplay();
+    // Trả servo về vị trí mặc định
+    myServo.write(defaultAngle);
 }
-
-
-void loop() {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.print("Scanning for objects...");
-    display.display();
-
-    // Delay to simulate live scanning
-    ei_sleep(5);
-
-    snapshot_buf = (uint8_t *)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
-
-    if (snapshot_buf == nullptr) {
-        ei_printf("ERR: Failed to allocate snapshot buffer!\n");
-        display.clearDisplay();
-        display.setCursor(0, 0);
-        display.print("Error: Snapshot buffer");
-        display.display();
-        delay(2000); // Delay to allow error message to be read
-        return;
-    }
-
-    ei::signal_t signal;
-    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-    signal.get_data = &ei_camera_get_data;
-
-    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
-        ei_printf("Failed to capture image\r\n");
-        free(snapshot_buf);
-
-        display.clearDisplay();
-        display.setCursor(0, 0);
-        display.print("Error: Camera capture");
-        display.display();
-        delay(2000); // Delay to allow error message to be read
-        return;
-    }
-
-    ei_impulse_result_t result = {0};
-    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
-
-    if (err != EI_IMPULSE_OK) {
-        ei_printf("ERR: Failed to run classifier (%d)\n", err);
-
-        display.clearDisplay();
-        display.setCursor(0, 0);
-        display.print("Error: Classification");
-        display.display();
-        delay(2000); // Delay to allow error message to be read
-        free(snapshot_buf);
-        return;
-    }
-
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("Objects Detected:");
-
-    bool bb_found = false;
-    const char *detected_label = nullptr;
-
-    // Process bounding boxes
-    for (size_t ix = 0; ix < result.bounding_boxes_count; ix++) {
-        auto bb = result.bounding_boxes[ix];
-        if (bb.value == 0) {
-            continue;
-        }
-
-        bb_found = true;
-        detected_label = bb.label; // Store the detected label
-
-        ei_printf("    %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\n", bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
-
-        display.setCursor(0, 10); // Display one result
-        display.print(bb.label);
-        display.print(": ");
-        display.print(int(bb.value * 100));
-        display.print("%");
-        display.display();
-        break; // Only process the first bounding box
-    }
-
-    if (!bb_found) {
-        ei_printf("    No objects found\n");
-
-        display.setCursor(0, 20);
-        display.print("No objects found");
-        display.display();
-        myServo.write(90); // Reset servo
-    } else {
-        // Perform servo actions after detection loop
-        if (strcmp(detected_label, "bottle") == 0) {
-            display.clearDisplay();
-            display.setCursor(0, 0);
-            display.print("Object: Bottle");
-            display.setCursor(0, 10);
-            display.print("Servo: Rotating");
-            display.display();
-
-            for (int angle = 90; angle <= 150; angle += 15) {
-                myServo.write(angle);
-                delay(100);
-            }
-
-            display.setCursor(0, 20);
-            display.print("Holding position...");
-            display.display();
-            delay(4000); // Hold servo position for 4 seconds
-
-            myServo.write(90);
-
-            display.clearDisplay();
-            display.setCursor(0, 0);
-            display.print("Servo: Reset");
-            display.display();
-            delay(1000); // Show reset message
-        } else if (strcmp(detected_label, "can") == 0) {
-            display.clearDisplay();
-            display.setCursor(0, 0);
-            display.print("Object: Can");
-            display.setCursor(0, 10);
-            display.print("Servo: Rotating");
-            display.display();
-
-            for (int angle = 90; angle >= 30; angle -= 15) {
-                myServo.write(angle);
-                delay(100);
-            }
-
-            display.setCursor(0, 20);
-            display.print("Holding position...");
-            display.display();
-            delay(4000); // Hold servo position for 4 seconds
-
-            myServo.write(90);
-
-            display.clearDisplay();
-            display.setCursor(0, 0);
-            display.print("Servo: Reset");
-            display.display();
-            delay(1000); // Show reset message
-        }
-    }
-
-    free(snapshot_buf);
-
-#if EI_CLASSIFIER_HAS_ANOMALY == 1
-    ei_printf("    anomaly score: %.3f\n", result.anomaly);
-
-    display.setCursor(0, 50);
-    display.print("Anomaly: ");
-    display.print(result.anomaly, 3);
-    display.display();
-
-    delay(4000); // Hold anomaly score on OLED for 4 seconds
 #endif
 
-    display.clearDisplay(); // Clear OLED before the next iteration
-    display.display();
-}
 
+
+  free(snapshot_buf);
+}
 
 /**
  * @brief   Setup image sensor & start streaming
